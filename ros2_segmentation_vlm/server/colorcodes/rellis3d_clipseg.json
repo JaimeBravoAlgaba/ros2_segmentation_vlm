@@ -1,0 +1,20 @@
+{
+  "trail . path . tracks": [99, 66, 34],
+  "grass . lawn": [0, 102, 0],
+  "tree . branches": [0, 255, 0],
+  "water": [134, 255, 239],
+  "pole . post": [0, 153, 153],
+  "sky": [0, 0, 255],
+  "vehicle": [255, 255, 0],
+  "asphalt . blacktop": [64, 64, 64],
+  "building . house": [255, 0, 0],
+  "log . wood": [102, 0, 0],
+  "person": [204, 153, 255],
+  "fence": [102, 0, 204],
+  "bush . shrub": [255, 153, 204],
+  "concrete": [170, 170, 170],
+  "barrier . barricade": [41, 121, 255],
+  "puddle . pool": [134, 255, 239],
+  "mud . soil": [99, 66, 34],
+  "rubble . debris . wreckage": [110, 22, 138]
+}

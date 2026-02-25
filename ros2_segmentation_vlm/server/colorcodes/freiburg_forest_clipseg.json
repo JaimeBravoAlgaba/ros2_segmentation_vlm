@@ -1,0 +1,13 @@
+{
+  "void": [255,255,255],
+  "person": [0,0,0],
+  "rock": [0,0,0],
+  "bench": [0,0,0],
+  "sign": [0,0,0],
+  "building": [0,0,0],
+  "trail . path . road . dirt": [170, 170, 170],
+  "grass . lawn": [0, 255, 0],
+  "sky": [0, 120 , 255],
+  "trees . forest . wood . branches": [102, 102, 51],
+  "vegetation . bushes": [102, 102, 51]
+}

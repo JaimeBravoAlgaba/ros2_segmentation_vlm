@@ -1,0 +1,5 @@
+{
+  "person": [255, 0, 0],
+  "furniture . chair . sofa . couch": [0, 255, 0],
+  "bag . backpack . purse": [0, 0, 255]
+}
