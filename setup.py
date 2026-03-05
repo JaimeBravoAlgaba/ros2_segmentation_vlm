@@ -10,6 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/ros2_segmentation_vlm/launch', ['launch/segmentation_bridge.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -20,6 +21,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'ros2_segmentation_node = ros2_segmentation_vlm.ros2_segmentation_node:main',
         ],
     },
 )
