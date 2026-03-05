@@ -23,11 +23,11 @@ class SemanticCloudNode(Node):
         self.declare_parameter('input_rgb_topic', '/segmentation/color/image')
         self.declare_parameter('input_depth_topic', '/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/aligned_depth_to_color/camera_info')
-        self.declare_parameter('output_cloud_topic', '/pointcloud/semantics')
+        self.declare_parameter('output_cloud_topic', '/segmentation/color/points')
         self.declare_parameter('depth_is_16UC1_in_mm', True)  # change if needed
         self.declare_parameter('decimation', 4)               # skip pixels for speed
         self.declare_parameter('queue_size', 5)
-        self.declare_parameter('time_slop', 30)               # seconds for ApproximateTimeSynchronizer
+        self.declare_parameter('time_slop', 10)               # seconds for ApproximateTimeSynchronizer
     
         seg_topic = self.get_parameter('input_rgb_topic').value
         depth_topic = self.get_parameter('input_depth_topic').value
