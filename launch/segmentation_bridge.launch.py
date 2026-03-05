@@ -1,15 +1,47 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+from ament_index_python.packages import get_package_share_directory
+import os
 
 
 def generate_launch_description():
 
+    # Launch arguments
     host = LaunchConfiguration('host')
     port = LaunchConfiguration('port')
     input_topic = LaunchConfiguration('input_topic')
     output_topic = LaunchConfiguration('output_topic')
+    rviz = LaunchConfiguration('rviz')
+
+    # Get RViz config path
+    pkg_share = get_package_share_directory('ros2_segmentation_vlm')
+    rviz_config = os.path.join(pkg_share, 'rviz', 'ros2_segmentation_vlm.rviz')
+
+    segmentation_bridge = Node(
+        package='ros2_segmentation_vlm',
+        executable='ros2_segmentation_node',
+        name='segmentation_bridge_node',
+        output='screen',
+        parameters=[{
+            'host': host,
+            'port': port,
+            'input_topic': input_topic,
+            'output_topic': output_topic
+        }]
+    )
+
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_config],
+        output='screen',
+        condition=IfCondition(rviz)
+    )
 
     return LaunchDescription([
 
@@ -34,20 +66,15 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'output_topic',
             default_value='/segmentation/color/image',
-            description='Output segmented image topic'
+            description='Output segmentation topic'
         ),
 
-        Node(
-            package='ros2_segmentation_vlm',
-            executable='ros2_segmentation_node',  # nombre del executable en setup.py
-            name='segmentation_bridge_node',
-            output='screen',
+        DeclareLaunchArgument(
+            'rviz',
+            default_value='true',
+            description='Launch RViz'
+        ),
 
-            parameters=[{
-                'host': host,
-                'port': port,
-                'input_topic': input_topic,
-                'output_topic': output_topic
-            }]
-        )
+        segmentation_bridge,
+        rviz_node
     ])
