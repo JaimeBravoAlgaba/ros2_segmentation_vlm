@@ -2,6 +2,10 @@
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+import time
+import io
+import socket
+import struct
 
 import cv2
 import numpy as np
@@ -35,13 +39,17 @@ class CloudMapProjector(Node):
         self.declare_parameter("map_data_topic", "/rtabmap/mapData")
         self.declare_parameter("cloud_map_topic", "/rtabmap/cloud_map")
         self.declare_parameter("output_cloud_topic", "/semantic_cloud")
+        self.declare_parameter("segmentation_server_host", "127.0.0.1")
+        self.declare_parameter("segmentation_server_port", 8765)
+        self.declare_parameter("segmentation_socket_timeout_sec", 30.0)
+        self.declare_parameter("reconnect_delay_sec", 1.0)
 
         self.declare_parameter("target_frame", "map")
         self.declare_parameter("pixel_step", 1)
         self.declare_parameter("max_depth_m", 20.0)
         self.declare_parameter("z_buffer_margin", 0.02)
-        self.declare_parameter("color_voxel_size", 0.05)
-        self.declare_parameter("default_gray", 140)
+        self.declare_parameter("color_voxel_size", 0.02)
+        self.declare_parameter("unknown_rgb", [0, 0, 0])
         self.declare_parameter("rebuild_rate_hz", 0.5)
         self.declare_parameter("verbose", True)
 
@@ -54,7 +62,17 @@ class CloudMapProjector(Node):
         self.max_depth_m = float(self.get_parameter("max_depth_m").value)
         self.z_buffer_margin = float(self.get_parameter("z_buffer_margin").value)
         self.color_voxel_size = float(self.get_parameter("color_voxel_size").value)
-        self.default_gray = int(self.get_parameter("default_gray").value)
+        unknown_rgb_value = self.get_parameter("unknown_rgb").value
+        if isinstance(unknown_rgb_value, (list, tuple)) and len(unknown_rgb_value) == 3:
+            self.unknown_rgb = tuple(int(np.clip(v, 0, 255)) for v in unknown_rgb_value)
+        else:
+            self.unknown_rgb = (0, 0, 0)
+        self.segmentation_server_host = str(self.get_parameter("segmentation_server_host").value)
+        self.segmentation_server_port = int(self.get_parameter("segmentation_server_port").value)
+        self.segmentation_socket_timeout_sec = float(
+            self.get_parameter("segmentation_socket_timeout_sec").value
+        )
+        self.reconnect_delay_sec = float(self.get_parameter("reconnect_delay_sec").value)
         rebuild_rate_hz = float(self.get_parameter("rebuild_rate_hz").value)
         self.verbose = bool(self.get_parameter("verbose").value)
 
@@ -67,9 +85,11 @@ class CloudMapProjector(Node):
         # Grafo optimizado actual
         self.graph_poses: Dict[int, Pose] = {}
         self.last_graph_signature: Optional[Tuple[int, int]] = None
+        self.last_map_node_ids_signature: Optional[Tuple[int, int, int]] = None
 
         # Observaciones por nodo
         self.node_observations: Dict[int, NodeObservation] = {}
+        self.seg_sock: Optional[socket.socket] = None
 
         # Acumulador reconstruido en cada rebuild
         # voxel -> [sum_r, sum_g, sum_b, count]
@@ -90,7 +110,6 @@ class CloudMapProjector(Node):
             self.cloud_map_callback,
             10,
         )
-
         self.cloud_pub = self.create_publisher(PointCloud2, output_cloud_topic, 10)
 
         period = 1.0 / rebuild_rate_hz if rebuild_rate_hz > 0.0 else 2.0
@@ -100,8 +119,15 @@ class CloudMapProjector(Node):
         self.get_logger().info(f"  map_data_topic     : {map_data_topic}")
         self.get_logger().info(f"  cloud_map_topic    : {cloud_map_topic}")
         self.get_logger().info(f"  output_cloud_topic : {output_cloud_topic}")
+        self.get_logger().info(
+            f"  seg_server         : {self.segmentation_server_host}:{self.segmentation_server_port}"
+        )
+        self.get_logger().info(f"  seg_timeout_sec    : {self.segmentation_socket_timeout_sec}")
+        self.get_logger().info(f"  unknown_rgb        : {self.unknown_rgb}")
         self.get_logger().info(f"  color_voxel_size   : {self.color_voxel_size}")
         self.get_logger().info(f"  rebuild_rate_hz    : {rebuild_rate_hz}")
+
+        self._connect_segmentation_server()
 
     # =========================================================
     # Callbacks
@@ -136,6 +162,7 @@ class CloudMapProjector(Node):
             self.get_logger().error(f"Error leyendo cloud_map: {e}")
 
     def map_data_callback(self, msg: MapData) -> None:
+        self.maybe_reset_state_on_map_reinit(msg)
         self.update_graph_poses(msg)
 
         graph_signature = self.compute_graph_signature(msg)
@@ -147,20 +174,36 @@ class CloudMapProjector(Node):
             if self.verbose:
                 self.get_logger().info("Cambio detectado en el grafo de RTAB-Map")
 
-        new_obs = 0
-        for node in msg.nodes:
+        candidate_node: Optional[RtabmapNode] = None
+        for node in reversed(msg.nodes):
             node_id = int(node.id)
             if node_id not in self.node_observations:
-                obs = self.extract_observation_from_node(node)
-                if obs is not None:
-                    self.node_observations[node_id] = obs
-                    new_obs += 1
+                candidate_node = node
+                break
 
-        if new_obs > 0:
-            self.map_dirty = True
-            self.get_logger().info(
-                f"Nuevas observaciones guardadas: {new_obs}, total={len(self.node_observations)}"
-            )
+        if candidate_node is None:
+            if self.verbose:
+                self.get_logger().info(
+                    f"Sin nodos nuevos para segmentar. total_msg_nodes={len(msg.nodes)}, "
+                    f"total_ready={len(self.node_observations)}"
+                )
+            return
+
+        obs = self.extract_observation_from_node(candidate_node)
+        if obs is None:
+            return
+
+        segmented_rgb = self.segment_image_blocking(obs.rgb)
+        if segmented_rgb is None:
+            if self.verbose:
+                self.get_logger().warning(
+                    f"Node {obs.node_id}: segmentacion fallida o timeout; no se proyecta."
+                )
+            return
+
+        obs.rgb = segmented_rgb
+        self.node_observations[obs.node_id] = obs
+        self.map_dirty = True
 
     # =========================================================
     # Graph poses
@@ -279,6 +322,88 @@ class CloudMapProjector(Node):
             local_transform=data.local_transform[0],
         )
 
+    def _connect_segmentation_server(self) -> None:
+        if self.seg_sock is not None:
+            return
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(self.segmentation_socket_timeout_sec)
+            s.connect((self.segmentation_server_host, self.segmentation_server_port))
+            self.seg_sock = s
+            self.get_logger().info(
+                f"Conectado al servidor de segmentacion en "
+                f"{self.segmentation_server_host}:{self.segmentation_server_port}"
+            )
+        except Exception as e:
+            self.seg_sock = None
+            self.get_logger().warning(f"No se pudo conectar al servidor de segmentacion: {e}")
+
+    def _close_segmentation_socket(self) -> None:
+        if self.seg_sock is None:
+            return
+        try:
+            self.seg_sock.close()
+        except Exception:
+            pass
+        self.seg_sock = None
+
+    def _recvall(self, sock: socket.socket, n: int) -> Optional[bytes]:
+        data = b""
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+    def _send_msg(self, sock: socket.socket, payload: bytes) -> None:
+        sock.sendall(struct.pack(">I", len(payload)) + payload)
+
+    def _recv_msg(self, sock: socket.socket) -> Optional[bytes]:
+        raw_len = self._recvall(sock, 4)
+        if raw_len is None:
+            return None
+        msg_len = struct.unpack(">I", raw_len)[0]
+        return self._recvall(sock, msg_len)
+
+    def segment_image_blocking(self, bgr: np.ndarray) -> Optional[np.ndarray]:
+        if self.seg_sock is None:
+            self._connect_segmentation_server()
+        if self.seg_sock is None:
+            return None
+
+        try:
+            buf = io.BytesIO()
+            np.save(buf, bgr, allow_pickle=False)
+            self._send_msg(self.seg_sock, buf.getvalue())
+
+            response = self._recv_msg(self.seg_sock)
+            if response is None or len(response) < 12:
+                raise RuntimeError("respuesta vacia o incompleta")
+
+            h, w, c = struct.unpack(">III", response[:12])
+            img_data = response[12:]
+            expected_len = h * w * c
+            if len(img_data) != expected_len:
+                raise RuntimeError(
+                    f"tamano inesperado: got={len(img_data)}, expected={expected_len}"
+                )
+
+            seg_rgb = np.frombuffer(img_data, dtype=np.uint8).reshape((h, w, c))
+            seg_bgr = cv2.cvtColor(seg_rgb, cv2.COLOR_RGB2BGR)
+            if seg_bgr.shape[:2] != bgr.shape[:2]:
+                seg_bgr = cv2.resize(
+                    seg_bgr,
+                    (bgr.shape[1], bgr.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            return seg_bgr
+        except Exception as e:
+            self.get_logger().warning(f"Fallo de segmentacion bloqueante: {e}")
+            self._close_segmentation_socket()
+            time.sleep(self.reconnect_delay_sec)
+            return None
+
     # =========================================================
     # Projection with z-buffer
     # =========================================================
@@ -386,7 +511,7 @@ class CloudMapProjector(Node):
         if self.latest_cloud_points is None or self.latest_cloud_points.shape[0] == 0:
             return
 
-        gray = self.default_gray
+        unk_r, unk_g, unk_b = self.unknown_rgb
         output_points: List[PointXYZRGB] = []
 
         for i in range(self.latest_cloud_points.shape[0]):
@@ -403,7 +528,7 @@ class CloudMapProjector(Node):
                 g = int(np.clip(acc[1] / count, 0, 255))
                 b = int(np.clip(acc[2] / count, 0, 255))
             else:
-                r = g = b = gray
+                r, g, b = unk_r, unk_g, unk_b
 
             rgb_uint32 = self.pack_rgb(r, g, b)
             output_points.append((x, y, z, rgb_uint32))
@@ -482,6 +607,45 @@ class CloudMapProjector(Node):
                 pass
 
         return (num_nodes, num_links)
+
+    def compute_node_ids_signature(self, msg: MapData) -> Optional[Tuple[int, int, int]]:
+        if not msg.nodes:
+            return None
+        node_ids = [int(n.id) for n in msg.nodes]
+        return (len(node_ids), min(node_ids), max(node_ids))
+
+    def maybe_reset_state_on_map_reinit(self, msg: MapData) -> None:
+        current_sig = self.compute_node_ids_signature(msg)
+        previous_sig = self.last_map_node_ids_signature
+        self.last_map_node_ids_signature = current_sig
+
+        if previous_sig is None or current_sig is None:
+            return
+
+        prev_count, prev_min_id, prev_max_id = previous_sig
+        curr_count, curr_min_id, curr_max_id = current_sig
+
+        # Heurística robusta de reinicio/relocalización fuerte del mapa:
+        # 1) caída brusca del número de nodos o
+        # 2) rango de IDs retrocede claramente.
+        node_count_dropped = curr_count < prev_count and curr_count < max(10, prev_count // 3)
+        ids_moved_back = curr_max_id < prev_min_id or curr_min_id < prev_min_id
+
+        if not (node_count_dropped or ids_moved_back):
+            return
+
+        self.get_logger().warning(
+            "Detectado posible reset/reinicio de mapa RTAB-Map. "
+            "Limpiando estado semántico e inferencia en vuelo."
+        )
+        self.reset_semantic_state()
+
+    def reset_semantic_state(self) -> None:
+        self.node_observations.clear()
+        self.graph_poses.clear()
+        self.color_accumulator.clear()
+        self._close_segmentation_socket()
+        self.map_dirty = True
 
     def pose_to_matrix(self, pose: Pose) -> np.ndarray:
         T = np.eye(4, dtype=np.float64)
@@ -565,6 +729,7 @@ def main(args=None) -> None:
     except KeyboardInterrupt:
         node.get_logger().info("Interrumpido por teclado.")
     finally:
+        node._close_segmentation_socket()
         node.destroy_node()
         rclpy.shutdown()
 

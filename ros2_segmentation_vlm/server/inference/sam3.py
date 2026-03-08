@@ -11,6 +11,7 @@ from inference.sam3_multi_prompt import Sam3MultiPromptProcessor
 from utils.utils import load_colorcode
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 # Paths & threshold (adjust as needed)
 IMAGE_PATH = "/home/jaime/repos/SAM_labeler/data/ETSII/rgb/color_20250604_163126.png"
