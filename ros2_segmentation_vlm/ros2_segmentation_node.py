@@ -49,10 +49,10 @@ class SegmentationBridgeNode(Node):
         # Parameters
         self.declare_parameter("host", "127.0.0.1")
         self.declare_parameter("port", 8765)
-        self.declare_parameter("input_topic", "/camera/color/image_raw")
+        self.declare_parameter("input_topic", "/segmentation_input_image")
         self.declare_parameter("output_topic", "/segmentation/color/image")
         self.declare_parameter("reconnect_delay", 1.0)
-        self.declare_parameter("qos_depth", 10)
+        self.declare_parameter("qos_depth", 2)
 
         # NEW: QoS reliability selection for input (camera usually BEST_EFFORT)
         # Options: "best_effort" (recommended), "reliable"

@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'ros2_segmentation_node = ros2_segmentation_vlm.ros2_segmentation_node:main',
+            'ros2_semantics_node = ros2_segmentation_vlm.ros2_semantics_node:main',
         ],
     },
 )
