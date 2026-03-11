@@ -36,12 +36,6 @@ prompts, colors = load_colorcode(COLORCODE_PATH)
 print(f"Loaded {len(prompts)} prompts from colorcode:")
 print(prompts)
 
-if len(prompts) > 255:
-    raise ValueError(
-        f"Hay {len(prompts)} clases, pero una máscara uint8 de un canal "
-        f"solo permite 256 valores. Reserva 255 para fondo/no-clase."
-    )
-
 print("Encoding text prompts for SAM3...")
 processor.set_text_prompts(prompts)
 
@@ -50,44 +44,29 @@ processor.set_text_prompts(prompts)
 # SAM3 segmentation that mirrors CLIPSeg strategy
 # -------------------------------------------------------------------------
 
-def segment_image(image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+def segment_image(image: Image.Image) -> np.ndarray:
     """
     Segment an image using SAM3 with given prompts and colors.
-
-    Strategy:
+    Mirrors the CLIPSeg fusion strategy:
       - For each pixel, keep only the class (prompt) with the highest score.
       - Colors come from the colormap JSON.
-      - Also returns a uint8 class-index map:
-            0..N-1 -> class index
-            255    -> background / no class assigned
 
     Args:
         image: PIL Image (RGB)
 
     Returns:
-        segm_colors_rgba: numpy array (H, W, 4) with RGBA segmentation
-        class_map: numpy array (H, W) uint8 with class index per pixel
+        segm_colors_rgba: numpy array (H, W, 4) with RGBA segmentation.
     """
     image = image.convert("RGB")
     width, height = image.size
 
     # Run SAM3 multi-prompt segmentation
-    if device.type == "cuda":
-        autocast_context = autocast(device_type="cuda", dtype=torch.float16)
-    else:
-        # En CPU evitamos autocast de CUDA
-        from contextlib import nullcontext
-        autocast_context = nullcontext()
-
-    with torch.inference_mode(), autocast_context:
+    with torch.inference_mode(), autocast(device_type="cuda", dtype=torch.float16):
         results = processor.segment_image_with_text_prompts(image)
 
-    # Initialize per-pixel best scores and outputs
-    segm_colors = 255 * np.ones((height, width, 3), dtype=np.uint8)
+    # Initialize per-pixel best scores and colors
+    segm_colors = 255*np.ones((height, width, 3), dtype=np.uint8)
     segm_scores = np.zeros((height, width), dtype=np.float32)
-
-    # 255 = background / unassigned
-    class_map = np.full((height, width), 255, dtype=np.uint8)
 
     # For each prompt, we may have multiple instance masks with their own scores.
     # We treat per-pixel value as "score if inside mask, else 0",
@@ -116,23 +95,24 @@ def segment_image(image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
         for inst_idx in range(masks_np.shape[0]):
             score = float(scores_np[inst_idx])
             if score < THRESHOLD:
-                continue  # extra safety threshold
+                continue  # extra safety threshold, even though SAM3 already filters
 
             mask_k = masks_np[inst_idx]  # (H, W) boolean
 
-            # Update only where this instance beats the current best score
+            # For the pixels where this mask is present, update only if
+            # this instance's score is higher than the current best.
             better_pixels = mask_k & (score > segm_scores)
 
+            # Apply this prompt's color to those pixels
             if np.any(better_pixels):
                 segm_colors[better_pixels] = colors[prompt_idx]
                 segm_scores[better_pixels] = score
-                class_map[better_pixels] = np.uint8(prompt_idx)
 
     # Add fully-opaque alpha channel
     alpha = np.full((height, width), 255, dtype=np.uint8)
     segm_colors_rgba = np.dstack((segm_colors, alpha))
 
-    return segm_colors_rgba, class_map
+    return segm_colors_rgba
 
 
 # -------------------------------------------------------------------------
@@ -143,22 +123,15 @@ if __name__ == "__main__":
     image = Image.open(IMAGE_PATH).convert("RGB")
 
     t0 = time.time()
-    segmented_colors, class_map = segment_image(image)
+    segmented_colors = segment_image(image)
     print(f"Segmentation took {time.time() - t0:.2f} seconds.")
 
-    # Save colored result
+    # Save or display results
     segmented_image = Image.fromarray(segmented_colors)
     segmented_image.save("sam3_segmented_output.png")
 
-    # Save class-index image (single channel uint8)
-    class_map_image = Image.fromarray(class_map, mode="L")
-    class_map_image.save("sam3_class_indices.png")
-
-    # Optionally save raw numpy array too
-    np.save("sam3_class_indices.npy", class_map)
-
     # Display original and segmented images side by side
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 6))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
 
     ax1.imshow(image)
     ax1.set_title("Original Image")
@@ -168,23 +141,20 @@ if __name__ == "__main__":
     ax2.set_title("SAM3 Segmented Image")
     ax2.axis("off")
 
-    ax3.imshow(class_map, cmap="tab20", vmin=0, vmax=max(len(prompts) - 1, 1))
-    ax3.set_title("Class Index Map")
-    ax3.axis("off")
-
-    # Create a separate figure for the legend
+    # Create a separate figure for the legend (same style as CLIPSeg)
     legend_fig, legend_ax = plt.subplots(figsize=(8, 2))
     legend_ax.axis("off")
 
     legend_elements = []
-    for class_idx, (prompt, color) in enumerate(zip(prompts, colors)):
+    for prompt, color in zip(prompts, colors):
+        # color is already [R, G, B] in 0–255
         legend_elements.append(
             plt.Rectangle(
                 (0, 0),
                 1,
                 1,
                 facecolor=np.array(color) / 255.0,
-                label=f"{class_idx}: {prompt}",
+                label=prompt,
             )
         )
 

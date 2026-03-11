@@ -5,6 +5,7 @@ import io
 
 import numpy as np
 from PIL import Image
+import time
 
 import argparse
 args = argparse.ArgumentParser(description="Segmentation Server")
@@ -16,9 +17,11 @@ parsed_args = args.parse_args()
 if parsed_args.method == "gdinosam2":
     from inference.gdinosam2 import segment_image
 elif parsed_args.method == "clipseg":
-    from inferece.clipseg import segment_image
+    from inference.clipseg import segment_image
 elif parsed_args.method == "sam3":
     from inference.sam3 import segment_image
+elif parsed_args.method == "sam3_efficient":
+    from inference.sam3_efficient.efficientsam3.sam3_efficient import segment_image
 else:
     raise ValueError(f"Unsupported segmentation method: {parsed_args.method}")
 
@@ -73,29 +76,35 @@ def handle_client(conn):
                 raise TypeError(f"Unsupported image type: {type(img)}")
 
             # --- 3) Run segmentation ---
-            seg_out = segment_image(pil_img)
+            t0 = time.time()
+            seg_out, class_map = segment_image(pil_img)
+            print(f"[INFO] Segmentation done in {time.time() - t0:.2f} seconds.")
 
-            # --- 4) Back to numpy RGB array ---
+            # --- 4) Convert outputs to numpy ---
             if isinstance(seg_out, Image.Image):
                 seg_rgb = np.array(seg_out)
             else:
                 seg_rgb = np.asarray(seg_out)
 
             seg_rgb = seg_rgb.astype(np.uint8)
+            class_map = np.asarray(class_map).astype(np.uint8)
 
-            # If the model returns RGBA (4 channels), drop alpha
+            # Si viene RGBA, quitar alpha
             if seg_rgb.ndim == 3 and seg_rgb.shape[2] == 4:
-                seg_rgb = seg_rgb[:, :, :3]  # keep RGB only
+                seg_rgb = seg_rgb[:, :, :3]
 
-            h, w, c = seg_rgb.shape
-            print(f"[INFO] Seg result shape={seg_rgb.shape}, sending back...")
+            print(f"[INFO] seg_rgb shape={seg_rgb.shape}, class_map shape={class_map.shape}")
 
-            # --- 5) Encode as: [H,W,C header][raw bytes] ---
-            header = struct.pack('>III', h, w, c)
-            payload = header + seg_rgb.tobytes()
+            # --- 5) Send both arrays packed in one NPZ ---
+            out_buf = io.BytesIO()
+            np.savez_compressed(
+                out_buf,
+                seg_rgb=seg_rgb,
+                class_map=class_map,
+            )
+            send_msg(conn, out_buf.getvalue())
 
-            send_msg(conn, payload)
-            print(f"[SegServer] Sent segmented image with size={seg_rgb.shape}.")
+            print("[SegServer] Sent segmented image + class map.")
 
 
 def main():
