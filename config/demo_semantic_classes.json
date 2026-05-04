@@ -1,0 +1,31 @@
+{
+  "unknown_class_id": 255,
+  "unknown_color": [0, 0, 0],
+  "classes": [
+    {
+      "id": 0,
+      "name": "person",
+      "color": [0, 255, 0],
+      "traversable": true,
+      "traversability": 0.3,
+      "cost": 0.7
+    },
+    {
+      "id": 1,
+      "name": "leg",
+      "color": [255, 0, 0],
+      "traversable": false,
+      "traversability": 0.0,
+      "cost": 1.0
+    },
+    {
+      "id": 2,
+      "name": "vehicle",
+      "color": [255, 255, 0],
+      "traversable": true,
+      "traversability": 1.0,
+      "cost": 0.0
+    }
+  ]
+}
+

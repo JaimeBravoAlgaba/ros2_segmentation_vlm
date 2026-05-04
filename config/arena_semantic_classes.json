@@ -1,0 +1,54 @@
+{
+  "unknown_class_id": 255,
+  "unknown_color": [0, 0, 0],
+  "classes": [
+    {
+      "id": 0,
+      "name": "dirt . mulch . brown . forest floor",
+      "color": [128, 0, 0],
+      "traversable": true,
+      "traversability": 0.3,
+      "cost": 0.7
+    },
+    {
+      "id": 1,
+      "name": "grass",
+      "color": [0, 255, 0],
+      "traversable": true,
+      "traversability": 0.65,
+      "cost": 0.35
+    },
+    {
+      "id": 2,
+      "name": "bushes",
+      "color": [255, 0, 255],
+      "traversable": false,
+      "traversability": 0.1,
+      "cost": 0.9
+    },
+    {
+      "id": 3,
+      "name": "wall",
+      "color": [255, 0, 0],
+      "traversable": false,
+      "traversability": 0.0,
+      "cost": 1.0
+    },
+    {
+      "id": 4,
+      "name": "pavement",
+      "color": [170, 170, 170],
+      "traversable": true,
+      "traversability": 1.0,
+      "cost": 0.0
+    },
+    {
+      "id": 5,
+      "name": "asphalt",
+      "color": [80, 80, 80],
+      "traversable": true,
+      "traversability": 1.0,
+      "cost": 0.0
+    }
+  ]
+}

@@ -10,10 +10,20 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/segmentation_bridge.launch.py']),
+        (
+            'share/' + package_name + '/launch',
+            [
+                'launch/segmentation_bridge.launch.py',
+                'launch/semantics.launch.py',
+            ],
+        ),
+        ('share/' + package_name + '/config', ['config/demo_semantic_classes.json']),
         ('share/' + package_name + '/rviz', ['rviz/ros2_segmentation_vlm.rviz']),
     ],
-    install_requires=['setuptools'],
+    install_requires=[
+        'setuptools',
+        'numpy<2',
+    ],
     zip_safe=True,
     maintainer='jaime',
     maintainer_email='jaime.bravo.algaba@gmail.com',
@@ -24,6 +34,7 @@ setup(
         'console_scripts': [
             'ros2_segmentation_node = ros2_segmentation_vlm.ros2_segmentation_node:main',
             'ros2_semantics_node = ros2_segmentation_vlm.ros2_semantics_node:main',
+            'ros2_traversability_node = ros2_segmentation_vlm.ros2_traversability_node:main',
         ],
     },
 )

@@ -9,6 +9,7 @@ import os
 
 
 def generate_launch_description():
+    ros_python_env = {"PYTHONNOUSERSITE": "1"}
 
     # Launch arguments
     host = LaunchConfiguration('host')
@@ -26,6 +27,7 @@ def generate_launch_description():
         executable='ros2_segmentation_node',
         name='segmentation_bridge_node',
         output='screen',
+        additional_env=ros_python_env,
         parameters=[{
             'host': host,
             'port': port,

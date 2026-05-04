@@ -1,34 +1,57 @@
 #!/usr/bin/env python3
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-import time
 import io
+import os
 import socket
 import struct
+import time
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import rclpy
-from rclpy.node import Node
-
+from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, Transform
+from rclpy.node import Node
 from rtabmap_msgs.msg import MapData, Node as RtabmapNode
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
 
+from ros2_segmentation_vlm.segmentation_protocol import (
+    MSG_CONFIGURE_ACK,
+    MSG_ERROR,
+    MSG_SEGMENT_RESULT,
+    decode_message_type,
+    encode_configure_request,
+    encode_segment_request,
+)
+from ros2_segmentation_vlm.semantic_classes import (
+    SemanticClasses,
+    colorize_class_map,
+    load_semantic_classes,
+)
+
 
 VoxelKey = Tuple[int, int, int]
-PointXYZRGBClass = Tuple[float, float, float, int, int]
+ProjectedPoint = Tuple[float, float, float, int]
+PointXYZRGBSemantic = Tuple[float, float, float, int, int, int, float, float]
+
+
+@dataclass
+class ExtractedObservation:
+    node_id: int
+    rgb: np.ndarray
+    camera_info: CameraInfo
+    local_transform: Transform
 
 
 @dataclass
 class NodeObservation:
     node_id: int
-    rgb: np.ndarray
-    class_map: Optional[np.ndarray]
+    class_map: np.ndarray
     camera_info: CameraInfo
     local_transform: Transform
 
@@ -36,6 +59,12 @@ class NodeObservation:
 class CloudMapProjector(Node):
     def __init__(self) -> None:
         super().__init__("cloud_map_projector")
+
+        default_semantic_path = os.path.join(
+            get_package_share_directory("ros2_segmentation_vlm"),
+            "config",
+            "arena_semantic_classes.json",
+        )
 
         self.declare_parameter("map_data_topic", "/rtabmap/mapData")
         self.declare_parameter("cloud_map_topic", "/rtabmap/cloud_map")
@@ -46,14 +75,13 @@ class CloudMapProjector(Node):
         self.declare_parameter("segmentation_server_port", 8765)
         self.declare_parameter("segmentation_socket_timeout_sec", 30.0)
         self.declare_parameter("reconnect_delay_sec", 1.0)
+        self.declare_parameter("semantic_classes_path", default_semantic_path)
 
         self.declare_parameter("target_frame", "map")
         self.declare_parameter("pixel_step", 1)
         self.declare_parameter("max_depth_m", 20.0)
         self.declare_parameter("z_buffer_margin", 0.02)
         self.declare_parameter("color_voxel_size", 0.02)
-        self.declare_parameter("unknown_rgb", [0, 0, 0])
-        self.declare_parameter("unknown_class_id", 255)
         self.declare_parameter("rebuild_rate_hz", 0.5)
         self.declare_parameter("verbose", True)
 
@@ -63,21 +91,16 @@ class CloudMapProjector(Node):
         output_image_topic = self.get_parameter("output_image_topic").value
         output_class_topic = self.get_parameter("output_class_topic").value
 
+        semantic_classes_path = str(self.get_parameter("semantic_classes_path").value)
+        self.semantic_classes = load_semantic_classes(semantic_classes_path)
+        self.unknown_class_id = self.semantic_classes.unknown_class_id
+        self.unknown_rgb = self.semantic_classes.unknown_color
+
         self.target_frame = self.get_parameter("target_frame").value
         self.pixel_step = int(self.get_parameter("pixel_step").value)
         self.max_depth_m = float(self.get_parameter("max_depth_m").value)
         self.z_buffer_margin = float(self.get_parameter("z_buffer_margin").value)
         self.color_voxel_size = float(self.get_parameter("color_voxel_size").value)
-        unknown_rgb_value = self.get_parameter("unknown_rgb").value
-        if isinstance(unknown_rgb_value, (list, tuple)) and len(unknown_rgb_value) == 3:
-            self.unknown_rgb = tuple(int(np.clip(v, 0, 255)) for v in unknown_rgb_value)
-        else:
-            self.unknown_rgb = (0, 0, 0)
-
-        self.unknown_class_id = int(
-            np.clip(self.get_parameter("unknown_class_id").value, 0, 255)
-        )
-
         self.segmentation_server_host = str(self.get_parameter("segmentation_server_host").value)
         self.segmentation_server_port = int(self.get_parameter("segmentation_server_port").value)
         self.segmentation_socket_timeout_sec = float(
@@ -89,34 +112,24 @@ class CloudMapProjector(Node):
 
         self.bridge = CvBridge()
 
-        # Geometría actual del mapa
-        self.latest_cloud_points: Optional[np.ndarray] = None  # Nx3 float32
+        self.latest_cloud_points: Optional[np.ndarray] = None
         self.latest_cloud_stamp = None
 
-        # Grafo optimizado actual
         self.graph_poses: Dict[int, Pose] = {}
         self.last_graph_signature: Optional[Tuple[int, int]] = None
         self.last_map_node_ids_signature: Optional[Tuple[int, int, int]] = None
 
-        # Observaciones por nodo
         self.node_observations: Dict[int, NodeObservation] = {}
         self.seg_sock: Optional[socket.socket] = None
 
-        # Acumuladores por voxel
-        # voxel -> [sum_r, sum_g, sum_b, count]
-        self.color_accumulator: Dict[VoxelKey, np.ndarray] = {}
-        # voxel -> {class_id: votes}
         self.class_votes: Dict[VoxelKey, Dict[int, int]] = {}
+        # Punto de extensión para futuros atributos por clase, p. ej. coste o transitabilidad.
+        self.voxel_attribute_votes: Dict[str, Dict[VoxelKey, Dict[int, int]]] = {}
 
         self.map_dirty = False
         self.last_rebuild_summary = ""
 
-        self.map_data_sub = self.create_subscription(
-            MapData,
-            map_data_topic,
-            self.map_data_callback,
-            10,
-        )
+        self.map_data_sub = self.create_subscription(MapData, map_data_topic, self.map_data_callback, 10)
         self.cloud_map_sub = self.create_subscription(
             PointCloud2,
             cloud_map_topic,
@@ -131,33 +144,20 @@ class CloudMapProjector(Node):
         self.rebuild_timer = self.create_timer(period, self.rebuild_if_needed)
 
         self.get_logger().info("cloud_map_projector iniciado")
-        self.get_logger().info(f"  map_data_topic      : {map_data_topic}")
-        self.get_logger().info(f"  cloud_map_topic     : {cloud_map_topic}")
-        self.get_logger().info(f"  output_cloud_topic  : {output_cloud_topic}")
-        self.get_logger().info(f"  output_image_topic  : {output_image_topic}")
-        self.get_logger().info(f"  output_class_topic  : {output_class_topic}")
-        self.get_logger().info(
-            f"  seg_server          : {self.segmentation_server_host}:{self.segmentation_server_port}"
-        )
-        self.get_logger().info(f"  seg_timeout_sec     : {self.segmentation_socket_timeout_sec}")
-        self.get_logger().info(f"  unknown_rgb         : {self.unknown_rgb}")
+        self.get_logger().info(f"  semantic_classes    : {self.semantic_classes.source_path}")
+        self.get_logger().info(f"  semantic_prompts    : {len(self.semantic_classes.class_names)}")
         self.get_logger().info(f"  unknown_class_id    : {self.unknown_class_id}")
+        self.get_logger().info(f"  unknown_rgb         : {self.unknown_rgb}")
+        self.get_logger().info(f"  seg_server          : {self.segmentation_server_host}:{self.segmentation_server_port}")
+        self.get_logger().info(f"  seg_timeout_sec     : {self.segmentation_socket_timeout_sec}")
         self.get_logger().info(f"  color_voxel_size    : {self.color_voxel_size}")
         self.get_logger().info(f"  rebuild_rate_hz     : {rebuild_rate_hz}")
 
         self._connect_segmentation_server()
 
-    # =========================================================
-    # Callbacks
-    # =========================================================
-
     def cloud_map_callback(self, msg: PointCloud2) -> None:
         try:
-            pts_iter = point_cloud2.read_points(
-                msg,
-                field_names=("x", "y", "z"),
-                skip_nans=True,
-            )
+            pts_iter = point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
             pts = np.array(list(pts_iter))
 
             if pts.size == 0:
@@ -176,8 +176,8 @@ class CloudMapProjector(Node):
                 self.get_logger().info(
                     f"cloud_map recibido con {self.latest_cloud_points.shape[0]} puntos"
                 )
-        except Exception as e:
-            self.get_logger().error(f"Error leyendo cloud_map: {e}")
+        except Exception as exc:
+            self.get_logger().error(f"Error leyendo cloud_map: {exc}")
 
     def map_data_callback(self, msg: MapData) -> None:
         self.maybe_reset_state_on_map_reinit(msg)
@@ -211,29 +211,27 @@ class CloudMapProjector(Node):
         if obs is None:
             return
 
-        seg_result = self.segment_image_blocking(obs.rgb)
-        if seg_result is None:
+        class_map = self.segment_image_blocking(obs.rgb)
+        if class_map is None:
             if self.verbose:
                 self.get_logger().warning(
                     f"Node {obs.node_id}: segmentacion fallida o timeout; no se proyecta."
                 )
             return
 
-        segmented_bgr, class_map = seg_result
+        segmented_rgb = colorize_class_map(class_map, self.semantic_classes)
+        segmented_bgr = cv2.cvtColor(segmented_rgb, cv2.COLOR_RGB2BGR)
 
-        img_msg = self.bridge.cv2_to_imgmsg(segmented_bgr, encoding="bgr8")
-        class_msg = self.bridge.cv2_to_imgmsg(class_map, encoding="mono8")
-        self.image_pub.publish(img_msg)
-        self.class_pub.publish(class_msg)
+        self.image_pub.publish(self.bridge.cv2_to_imgmsg(segmented_bgr, encoding="bgr8"))
+        self.class_pub.publish(self.bridge.cv2_to_imgmsg(class_map, encoding="mono8"))
 
-        obs.rgb = segmented_bgr
-        obs.class_map = class_map
-        self.node_observations[obs.node_id] = obs
+        self.node_observations[obs.node_id] = NodeObservation(
+            node_id=obs.node_id,
+            class_map=class_map,
+            camera_info=obs.camera_info,
+            local_transform=obs.local_transform,
+        )
         self.map_dirty = True
-
-    # =========================================================
-    # Graph poses
-    # =========================================================
 
     def update_graph_poses(self, msg: MapData) -> None:
         graph = msg.graph
@@ -247,45 +245,30 @@ class CloudMapProjector(Node):
             for node_id, pose in zip(graph.node_ids, graph.poses):
                 self.graph_poses[int(node_id)] = pose
 
-    # =========================================================
-    # Rebuild logic
-    # =========================================================
-
     def rebuild_if_needed(self) -> None:
         if not self.map_dirty:
             return
-
         if self.latest_cloud_points is None or self.latest_cloud_points.shape[0] == 0:
             return
-
         if not self.node_observations:
             return
 
         self.rebuild_full_map()
 
     def rebuild_full_map(self) -> None:
-        self.color_accumulator.clear()
         self.class_votes.clear()
 
         total_visible = 0
         used_nodes = 0
         skipped_nodes = 0
 
-        node_ids = sorted(self.node_observations.keys())
-
-        for node_id in node_ids:
+        for node_id in sorted(self.node_observations.keys()):
             obs = self.node_observations[node_id]
-
-            if obs.class_map is None:
-                skipped_nodes += 1
-                continue
-
             if node_id not in self.graph_poses:
                 skipped_nodes += 1
                 continue
 
             pose_map_base = self.graph_poses[node_id]
-
             T_map_base = self.pose_to_matrix(pose_map_base)
             T_base_camera = self.transform_to_matrix(obs.local_transform)
             T_map_camera = T_map_base @ T_base_camera
@@ -293,7 +276,6 @@ class CloudMapProjector(Node):
 
             visible_points = self.project_cloud_with_zbuffer(
                 cloud_map_xyz=self.latest_cloud_points,
-                rgb=obs.rgb,
                 class_map=obs.class_map,
                 camera_info=obs.camera_info,
                 T_camera_map=T_camera_map,
@@ -310,22 +292,16 @@ class CloudMapProjector(Node):
 
         self.last_rebuild_summary = (
             f"Rebuild completo: "
-            f"nodes_total={len(node_ids)}, "
+            f"nodes_total={len(self.node_observations)}, "
             f"nodes_used={used_nodes}, "
             f"nodes_skipped={skipped_nodes}, "
             f"visible_points={total_visible}, "
-            f"colored_voxels={len(self.color_accumulator)}, "
             f"classified_voxels={len(self.class_votes)}"
         )
         self.get_logger().info(self.last_rebuild_summary)
-
         self.map_dirty = False
 
-    # =========================================================
-    # Observation extraction
-    # =========================================================
-
-    def extract_observation_from_node(self, node: RtabmapNode) -> Optional[NodeObservation]:
+    def extract_observation_from_node(self, node: RtabmapNode) -> Optional[ExtractedObservation]:
         if not hasattr(node, "data"):
             return None
 
@@ -347,10 +323,9 @@ class CloudMapProjector(Node):
                 self.get_logger().warning(f"Node {node.id}: no pude decodificar RGB")
             return None
 
-        return NodeObservation(
+        return ExtractedObservation(
             node_id=int(node.id),
             rgb=rgb,
-            class_map=None,
             camera_info=data.left_camera_info[0],
             local_transform=data.local_transform[0],
         )
@@ -358,18 +333,42 @@ class CloudMapProjector(Node):
     def _connect_segmentation_server(self) -> None:
         if self.seg_sock is not None:
             return
+
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(self.segmentation_socket_timeout_sec)
-            s.connect((self.segmentation_server_host, self.segmentation_server_port))
-            self.seg_sock = s
+            seg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            seg_sock.settimeout(self.segmentation_socket_timeout_sec)
+            seg_sock.connect((self.segmentation_server_host, self.segmentation_server_port))
+            self.seg_sock = seg_sock
+            self._configure_segmentation_server()
             self.get_logger().info(
                 f"Conectado al servidor de segmentacion en "
                 f"{self.segmentation_server_host}:{self.segmentation_server_port}"
             )
-        except Exception as e:
+        except Exception as exc:
             self.seg_sock = None
-            self.get_logger().warning(f"No se pudo conectar al servidor de segmentacion: {e}")
+            self.get_logger().warning(f"No se pudo conectar al servidor de segmentacion: {exc}")
+
+    def _configure_segmentation_server(self) -> None:
+        if self.seg_sock is None:
+            raise RuntimeError("Socket de segmentación no disponible.")
+
+        # Opción A: configuramos prompts una vez por conexión y los reenviamos tras reconectar.
+        payload = encode_configure_request(
+            self.semantic_classes.class_names,
+            self.semantic_classes.prompt_class_ids,
+        )
+        self._send_msg(self.seg_sock, payload)
+
+        response = self._recv_msg(self.seg_sock)
+        if response is None or len(response) == 0:
+            raise RuntimeError("Respuesta vacía al configurar prompts.")
+
+        data = np.load(io.BytesIO(response), allow_pickle=False)
+        message_type = decode_message_type(data)
+        if message_type == MSG_ERROR:
+            raise RuntimeError(str(np.asarray(data["error"]).item()))
+        if message_type != MSG_CONFIGURE_ACK:
+            raise RuntimeError(f"Respuesta inesperada al configurar prompts: {message_type}")
 
     def _close_segmentation_socket(self) -> None:
         if self.seg_sock is None:
@@ -399,64 +398,30 @@ class CloudMapProjector(Node):
         msg_len = struct.unpack(">I", raw_len)[0]
         return self._recvall(sock, msg_len)
 
-    def segment_image_blocking(
-        self,
-        bgr: np.ndarray,
-    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Envía una imagen BGR al servidor y recibe:
-          - seg_bgr: imagen segmentada en color (BGR)
-          - class_map: mapa de índices de clase (H, W) uint8
-        """
+    def segment_image_blocking(self, bgr: np.ndarray) -> Optional[np.ndarray]:
         if self.seg_sock is None:
             self._connect_segmentation_server()
         if self.seg_sock is None:
             return None
 
         try:
-            buf = io.BytesIO()
-            np.save(buf, bgr, allow_pickle=False)
-            self._send_msg(self.seg_sock, buf.getvalue())
-
+            self._send_msg(self.seg_sock, encode_segment_request(bgr))
             response = self._recv_msg(self.seg_sock)
             if response is None or len(response) == 0:
                 raise RuntimeError("respuesta vacia o incompleta")
 
-            payload_buf = io.BytesIO(response)
-            data = np.load(payload_buf, allow_pickle=False)
+            data = np.load(io.BytesIO(response), allow_pickle=False)
+            message_type = decode_message_type(data)
+            if message_type == MSG_ERROR:
+                raise RuntimeError(str(np.asarray(data["error"]).item()))
+            if message_type != MSG_SEGMENT_RESULT:
+                raise RuntimeError(f"Respuesta inesperada del servidor: {message_type}")
+            if "class_map" not in data:
+                raise RuntimeError("El servidor no devolvio 'class_map'.")
 
-            if "seg_rgb" not in data or "class_map" not in data:
-                raise RuntimeError("el servidor no devolvio 'seg_rgb' y 'class_map'")
-
-            seg_rgb = np.asarray(data["seg_rgb"])
-            class_map = np.asarray(data["class_map"])
-
-            if seg_rgb.dtype != np.uint8:
-                seg_rgb = seg_rgb.astype(np.uint8)
-
-            if class_map.dtype != np.uint8:
-                class_map = class_map.astype(np.uint8)
-
-            if seg_rgb.ndim != 3 or seg_rgb.shape[2] != 3:
-                raise RuntimeError(f"seg_rgb con shape invalida: {seg_rgb.shape}")
-
+            class_map = np.asarray(data["class_map"], dtype=np.uint8)
             if class_map.ndim != 2:
                 raise RuntimeError(f"class_map con shape invalida: {class_map.shape}")
-
-            if seg_rgb.shape[:2] != class_map.shape:
-                raise RuntimeError(
-                    f"seg_rgb y class_map tienen shapes incompatibles: "
-                    f"{seg_rgb.shape} vs {class_map.shape}"
-                )
-
-            seg_bgr = cv2.cvtColor(seg_rgb, cv2.COLOR_RGB2BGR)
-
-            if seg_bgr.shape[:2] != bgr.shape[:2]:
-                seg_bgr = cv2.resize(
-                    seg_bgr,
-                    (bgr.shape[1], bgr.shape[0]),
-                    interpolation=cv2.INTER_NEAREST,
-                )
 
             if class_map.shape[:2] != bgr.shape[:2]:
                 class_map = cv2.resize(
@@ -465,38 +430,29 @@ class CloudMapProjector(Node):
                     interpolation=cv2.INTER_NEAREST,
                 )
 
-            return seg_bgr, class_map
-
-        except Exception as e:
-            self.get_logger().warning(f"Fallo de segmentacion bloqueante: {e}")
+            return class_map
+        except Exception as exc:
+            self.get_logger().warning(f"Fallo de segmentacion bloqueante: {exc}")
             self._close_segmentation_socket()
             time.sleep(self.reconnect_delay_sec)
             return None
 
-    # =========================================================
-    # Projection with z-buffer
-    # =========================================================
-
     def project_cloud_with_zbuffer(
         self,
         cloud_map_xyz: np.ndarray,
-        rgb: np.ndarray,
         class_map: np.ndarray,
         camera_info: CameraInfo,
         T_camera_map: np.ndarray,
-    ) -> List[PointXYZRGBClass]:
+    ) -> List[ProjectedPoint]:
         fx = camera_info.k[0]
         fy = camera_info.k[4]
         cx = camera_info.k[2]
         cy = camera_info.k[5]
 
-        h, w = rgb.shape[:2]
+        h, w = class_map.shape
 
         pts_map_h = np.hstack(
-            [
-                cloud_map_xyz.astype(np.float64),
-                np.ones((cloud_map_xyz.shape[0], 1), dtype=np.float64),
-            ]
+            [cloud_map_xyz.astype(np.float64), np.ones((cloud_map_xyz.shape[0], 1), dtype=np.float64)]
         )
         pts_cam_h = (T_camera_map @ pts_map_h.T).T
         pts_cam = pts_cam_h[:, :3]
@@ -536,8 +492,7 @@ class CloudMapProjector(Node):
                 depth_buffer[vv, uu] = zz
                 index_buffer[vv, uu] = i
 
-        visible_points: List[PointXYZRGBClass] = []
-
+        visible_points: List[ProjectedPoint] = []
         ys, xs = np.where(index_buffer >= 0)
         for vv, uu in zip(ys, xs):
             i = index_buffer[vv, uu]
@@ -548,50 +503,23 @@ class CloudMapProjector(Node):
             px = pts_map[i, 0]
             py = pts_map[i, 1]
             pz = pts_map[i, 2]
-
-            b, g, r = rgb[vv, uu]
             class_id = int(class_map[vv, uu])
-
-            rgb_uint32 = self.pack_rgb(int(r), int(g), int(b))
-            visible_points.append(
-                (float(px), float(py), float(pz), rgb_uint32, class_id)
-            )
+            visible_points.append((float(px), float(py), float(pz), class_id))
 
         return visible_points
 
-    # =========================================================
-    # Color / class accumulation
-    # =========================================================
-
-    def accumulate_visible_points(self, points: List[PointXYZRGBClass]) -> None:
-        for x, y, z, rgb_uint32, class_id in points:
+    def accumulate_visible_points(self, points: List[ProjectedPoint]) -> None:
+        for x, y, z, class_id in points:
             key = self.xyz_to_voxel_key(x, y, z)
-
-            r = (rgb_uint32 >> 16) & 0xFF
-            g = (rgb_uint32 >> 8) & 0xFF
-            b = rgb_uint32 & 0xFF
-
-            if key not in self.color_accumulator:
-                self.color_accumulator[key] = np.array(
-                    [float(r), float(g), float(b), 1.0], dtype=np.float64
-                )
-            else:
-                self.color_accumulator[key][0] += float(r)
-                self.color_accumulator[key][1] += float(g)
-                self.color_accumulator[key][2] += float(b)
-                self.color_accumulator[key][3] += 1.0
-
             if key not in self.class_votes:
                 self.class_votes[key] = {}
-
             self.class_votes[key][class_id] = self.class_votes[key].get(class_id, 0) + 1
 
     def publish_accumulated_cloud(self) -> None:
         if self.latest_cloud_points is None or self.latest_cloud_points.shape[0] == 0:
             return
 
-        unk_r, unk_g, unk_b = self.unknown_rgb
-        output_points: List[PointXYZRGBClass] = []
+        output_points: List[PointXYZRGBSemantic] = []
 
         for i in range(self.latest_cloud_points.shape[0]):
             x = float(self.latest_cloud_points[i, 0])
@@ -599,45 +527,43 @@ class CloudMapProjector(Node):
             z = float(self.latest_cloud_points[i, 2])
 
             key = self.xyz_to_voxel_key(x, y, z)
-
-            if key in self.color_accumulator:
-                acc = self.color_accumulator[key]
-                count = max(acc[3], 1.0)
-                r = int(np.clip(acc[0] / count, 0, 255))
-                g = int(np.clip(acc[1] / count, 0, 255))
-                b = int(np.clip(acc[2] / count, 0, 255))
-            else:
-                r, g, b = unk_r, unk_g, unk_b
-
             if key in self.class_votes and self.class_votes[key]:
-                class_id = max(self.class_votes[key].items(), key=lambda kv: kv[1])[0]
+                class_id = self.select_majority_class_id(self.class_votes[key])
             else:
                 class_id = self.unknown_class_id
 
-            rgb_uint32 = self.pack_rgb(r, g, b)
-            output_points.append((x, y, z, rgb_uint32, int(class_id)))
+            r, g, b = self.semantic_classes.color_lut[class_id].tolist()
+            traversable = int(self.semantic_classes.traversable_lut[class_id])
+            traversability = float(self.semantic_classes.traversability_lut[class_id])
+            cost = float(self.semantic_classes.cost_lut[class_id])
+            rgb_uint32 = self.pack_rgb(int(r), int(g), int(b))
+            output_points.append(
+                (
+                    x,
+                    y,
+                    z,
+                    rgb_uint32,
+                    int(class_id),
+                    traversable,
+                    traversability,
+                    cost,
+                )
+            )
 
-        cloud_msg = self.create_cloud_msg(output_points, self.target_frame)
-        self.cloud_pub.publish(cloud_msg)
+        self.cloud_pub.publish(self.create_cloud_msg(output_points, self.target_frame))
 
         if self.verbose:
             self.get_logger().info(
                 f"Mapa publicado: total_points={len(output_points)}, "
-                f"colored_voxels={len(self.color_accumulator)}, "
                 f"classified_voxels={len(self.class_votes)}"
             )
 
+    def select_majority_class_id(self, votes: Dict[int, int]) -> int:
+        return max(votes.items(), key=lambda item: (item[1], -item[0]))[0]
+
     def xyz_to_voxel_key(self, x: float, y: float, z: float) -> VoxelKey:
         inv = 1.0 / self.color_voxel_size
-        return (
-            int(np.floor(x * inv)),
-            int(np.floor(y * inv)),
-            int(np.floor(z * inv)),
-        )
-
-    # =========================================================
-    # RGB extraction
-    # =========================================================
+        return (int(np.floor(x * inv)), int(np.floor(y * inv)), int(np.floor(z * inv)))
 
     def extract_rgb(self, raw_msg: Image, compressed_data) -> Optional[np.ndarray]:
         img = self.extract_rgb_raw(raw_msg)
@@ -672,10 +598,6 @@ class CloudMapProjector(Node):
         except Exception:
             return None
 
-    # =========================================================
-    # Graph / transforms
-    # =========================================================
-
     def compute_graph_signature(self, msg: MapData) -> Tuple[int, int]:
         num_nodes = len(msg.nodes)
         num_links = -1
@@ -696,7 +618,7 @@ class CloudMapProjector(Node):
     def compute_node_ids_signature(self, msg: MapData) -> Optional[Tuple[int, int, int]]:
         if not msg.nodes:
             return None
-        node_ids = [int(n.id) for n in msg.nodes]
+        node_ids = [int(node.id) for node in msg.nodes]
         return (len(node_ids), min(node_ids), max(node_ids))
 
     def maybe_reset_state_on_map_reinit(self, msg: MapData) -> None:
@@ -707,12 +629,11 @@ class CloudMapProjector(Node):
         if previous_sig is None or current_sig is None:
             return
 
-        prev_count, prev_min_id, prev_max_id = previous_sig
+        prev_count, prev_min_id, _ = previous_sig
         curr_count, curr_min_id, curr_max_id = current_sig
 
         node_count_dropped = curr_count < prev_count and curr_count < max(10, prev_count // 3)
         ids_moved_back = curr_max_id < prev_min_id or curr_min_id < prev_min_id
-
         if not (node_count_dropped or ids_moved_back):
             return
 
@@ -725,40 +646,34 @@ class CloudMapProjector(Node):
     def reset_semantic_state(self) -> None:
         self.node_observations.clear()
         self.graph_poses.clear()
-        self.color_accumulator.clear()
         self.class_votes.clear()
+        self.voxel_attribute_votes.clear()
         self._close_segmentation_socket()
         self.map_dirty = True
 
     def pose_to_matrix(self, pose: Pose) -> np.ndarray:
-        T = np.eye(4, dtype=np.float64)
-        T[:3, :3] = self.quaternion_to_rotation_matrix(
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[:3, :3] = self.quaternion_to_rotation_matrix(
             pose.orientation.x,
             pose.orientation.y,
             pose.orientation.z,
             pose.orientation.w,
         )
-        T[:3, 3] = [pose.position.x, pose.position.y, pose.position.z]
-        return T
+        matrix[:3, 3] = [pose.position.x, pose.position.y, pose.position.z]
+        return matrix
 
     def transform_to_matrix(self, tf_msg: Transform) -> np.ndarray:
-        T = np.eye(4, dtype=np.float64)
-        T[:3, :3] = self.quaternion_to_rotation_matrix(
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[:3, :3] = self.quaternion_to_rotation_matrix(
             tf_msg.rotation.x,
             tf_msg.rotation.y,
             tf_msg.rotation.z,
             tf_msg.rotation.w,
         )
-        T[:3, 3] = [tf_msg.translation.x, tf_msg.translation.y, tf_msg.translation.z]
-        return T
+        matrix[:3, 3] = [tf_msg.translation.x, tf_msg.translation.y, tf_msg.translation.z]
+        return matrix
 
-    def quaternion_to_rotation_matrix(
-        self,
-        x: float,
-        y: float,
-        z: float,
-        w: float,
-    ) -> np.ndarray:
+    def quaternion_to_rotation_matrix(self, x: float, y: float, z: float, w: float) -> np.ndarray:
         xx = x * x
         yy = y * y
         zz = z * z
@@ -778,18 +693,10 @@ class CloudMapProjector(Node):
             dtype=np.float64,
         )
 
-    # =========================================================
-    # PointCloud2 output
-    # =========================================================
-
     def pack_rgb(self, r: int, g: int, b: int) -> int:
         return (r << 16) | (g << 8) | b
 
-    def create_cloud_msg(
-        self,
-        points: List[PointXYZRGBClass],
-        frame_id: str,
-    ) -> PointCloud2:
+    def create_cloud_msg(self, points: List[PointXYZRGBSemantic], frame_id: str) -> PointCloud2:
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
         header.frame_id = frame_id
@@ -800,8 +707,10 @@ class CloudMapProjector(Node):
             PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
             PointField(name="rgb", offset=12, datatype=PointField.UINT32, count=1),
             PointField(name="class_id", offset=16, datatype=PointField.UINT8, count=1),
+            PointField(name="traversable", offset=17, datatype=PointField.UINT8, count=1),
+            PointField(name="traversability", offset=20, datatype=PointField.FLOAT32, count=1),
+            PointField(name="cost", offset=24, datatype=PointField.FLOAT32, count=1),
         ]
-
         return point_cloud2.create_cloud(header, fields, points)
 
     def destroy_node(self):
